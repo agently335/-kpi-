@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# 模型与数据库（不入库）
+*.db
+*.sqlite
+*.sqlite3
+*.pkl
+*.joblib
+models/
+uploads/
+
+# 前端
+node_modules/
+dist/
+.vite/
+*.local
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 日志与临时文件
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 预测输出（每次运行都会变）
+baseline_predictions.csv
+predictions_*.csv
