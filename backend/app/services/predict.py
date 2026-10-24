@@ -41,6 +41,7 @@ def predict_batch(
     model,
     df: pd.DataFrame,
     feature_names: list[str],
+    fill_values: dict[str, float] | None = None,
 ) -> PredictResult:
     """用已训练的模型批量预测。
 
@@ -52,14 +53,102 @@ def predict_batch(
         待预测数据，只含特征列，不含 fault。
     feature_names
         模型训练时的特征顺序。必须按这个顺序取列。
+    fill_values
+        训练时算出的缺失值填补值（每列中位数）。不传则用待预测数据自己的中位数。
 
     异常
     ----
     PredictError
         - code="DIMENSION_MISMATCH"：列数与模型不符
         - code="MISSING_COLUMN"：缺列
+        - code="BAD_VALUE"：列里有非数字
     """
-    raise NotImplementedError("丙来实现：model.predict_proba + 组装 PredictionRow")
+    import time
+
+    import numpy as np
+
+    started = time.perf_counter()
+
+    check_dimension(df, feature_names)
+
+    # 传进来的 feature_names 可能和模型实际训练时的不一致（调用方搞错），
+    # 所以再拿模型自己的 n_features_in_ 兜一层，避免 sklearn 抛出难读的 ValueError。
+    model_n = getattr(model, "n_features_in_", None)
+    if model_n is not None and model_n != len(feature_names):
+        raise PredictError(
+            f"模型需要 {model_n} 个特征，但传入了 {len(feature_names)} 个特征名",
+            code="DIMENSION_MISMATCH",
+            context={"model_features": int(model_n), "given_features": len(feature_names)},
+        )
+
+    # 严格按训练时的顺序取列，不信任文件里的列序
+    try:
+        X = df[feature_names].astype(float)
+    except (ValueError, TypeError) as exc:
+        raise PredictError(
+            f"待预测数据里有无法转成数字的值：{exc}",
+            code="BAD_VALUE",
+        ) from exc
+
+    # 缺失值填补：优先用训练时记录的中位数，保证线上线下一致
+    nan_cols = [c for c in feature_names if X[c].isna().any()]
+    if nan_cols:
+        for c in nan_cols:
+            if fill_values and c in fill_values:
+                val = fill_values[c]
+            else:
+                med = float(X[c].median())
+                val = med if np.isfinite(med) else 0.0
+            X[c] = X[c].fillna(val)
+
+    X_arr = X.to_numpy()
+    labels = model.predict(X_arr)
+
+    if hasattr(model, "predict_proba"):
+        probas = model.predict_proba(X_arr)
+        classes = list(getattr(model, "classes_", range(len(FAULT_NAMES))))
+    else:  # 理论上不会走到，兜底
+        probas = np.zeros((len(labels), len(FAULT_NAMES)))
+        probas[np.arange(len(labels)), labels] = 1.0
+        classes = list(range(len(FAULT_NAMES)))
+
+    rows: list[PredictionRow] = []
+    for i, label in enumerate(labels):
+        cls = int(label)
+        proba_full = _expand_proba(probas[i], classes)
+        rows.append(
+            PredictionRow(
+                row_index=i,
+                fault_class=cls,
+                fault_name=FAULT_NAMES[cls] if 0 <= cls < len(FAULT_NAMES) else "未知",
+                confidence=float(proba_full[cls]) if 0 <= cls < len(proba_full) else 0.0,
+                probabilities=proba_full,
+            )
+        )
+
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return PredictResult(
+        total_rows=len(rows),
+        predictions=rows,
+        elapsed_ms=round(elapsed_ms, 2),
+    )
+
+
+def _expand_proba(proba_row, classes: list[int]) -> list[float]:
+    """模型可能只见过部分类别，按 classes_ 映射回 0–5 的位置。"""
+    import numpy as np
+
+    arr = np.asarray(proba_row, dtype=float)
+    full = np.zeros(len(FAULT_NAMES), dtype=float)
+    for pos, cls in enumerate(classes):
+        cls = int(cls)
+        if 0 <= cls < len(FAULT_NAMES) and pos < len(arr):
+            full[cls] = arr[pos]
+
+    total = full.sum()
+    if total > 0:
+        full = full / total
+    return [float(x) for x in full]
 
 
 def check_dimension(df: pd.DataFrame, feature_names: list[str]) -> None:
